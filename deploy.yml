@@ -1,0 +1,148 @@
+# ─────────────────────────────────────────────
+# Story Land Food Safety System
+# CI/CD Pipeline — GitHub Actions
+#
+# Flujo:
+#   1. En cada push a cualquier rama → lint + typecheck + tests
+#   2. En merge a main → deploy automático
+#      - Frontend → Vercel
+#      - Backend  → Railway
+# ─────────────────────────────────────────────
+
+name: CI/CD
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+
+# Cancelar runs anteriores si hay uno nuevo para la misma rama
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────
+  # JOB 1: CI — corre en TODOS los pushes
+  # ──────────────────────────────────────────
+  ci:
+    name: CI (lint · typecheck · test)
+    runs-on: ubuntu-latest
+
+    services:
+      # PostgreSQL para los tests de integración
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: storyland
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: storyland_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    env:
+      DATABASE_URL: postgresql://storyland:testpassword@localhost:5432/storyland_test
+      JWT_SECRET: test-secret-key-only-for-ci-do-not-use-in-production
+      NODE_ENV: test
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Generar Prisma Client
+        run: npm run db:generate --workspace=apps/api
+
+      - name: Aplicar migraciones de test
+        run: npx prisma migrate deploy
+        working-directory: apps/api
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+
+      - name: TypeCheck (API)
+        run: npm run typecheck --workspace=apps/api
+
+      - name: TypeCheck (Web)
+        run: npm run typecheck --workspace=apps/web
+
+      - name: Lint (API)
+        run: npm run lint --workspace=apps/api
+
+      - name: Lint (Web)
+        run: npm run lint --workspace=apps/web
+
+      - name: Tests unitarios (API)
+        run: npm run test --workspace=apps/api
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+          JWT_SECRET: ${{ env.JWT_SECRET }}
+
+  # ──────────────────────────────────────────
+  # JOB 2: Deploy — solo en push a main
+  # ──────────────────────────────────────────
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: ci
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      # ── Deploy Frontend → Vercel ──────────
+      - name: Deploy Web → Vercel (Production)
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID_WEB }}
+          working-directory: apps/web
+          vercel-args: '--prod'
+
+      # ── Deploy Backend → Railway ──────────
+      - name: Deploy API → Railway
+        uses: bervProject/railway-deploy@main
+        with:
+          railway_token: ${{ secrets.RAILWAY_TOKEN }}
+          service: storyland-api
+
+      # ── Migraciones en producción ─────────
+      - name: Ejecutar migraciones en producción
+        run: npx prisma migrate deploy
+        working-directory: apps/api
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+
+      # ── Notificación de deploy exitoso ────
+      - name: Notificar deploy exitoso
+        if: success()
+        run: |
+          echo "✅ Deploy exitoso a producción"
+          echo "   Frontend: https://storyland-food-safety.vercel.app"
+          echo "   Backend:  https://storyland-api.railway.app"
+          echo "   Commit:   ${{ github.sha }}"
+          echo "   By:       ${{ github.actor }}"

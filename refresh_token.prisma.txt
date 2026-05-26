@@ -1,0 +1,20 @@
+// ─────────────────────────────────────────────
+// AGREGAR ESTE BLOQUE AL FINAL DE prisma/schema.prisma
+// ─────────────────────────────────────────────
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique  // SHA-256 del token, nunca el token plano
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("refresh_tokens")
+}
+
+// Agregar también en el modelo User:
+// refreshTokens RefreshToken[]

@@ -1,0 +1,321 @@
+// ============================================================
+// Story Land · Food Safety System
+// Prisma Schema — PostgreSQL
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────
+
+enum UserRole {
+  ADMIN      // acceso global a todos los edificios
+  SUPERVISOR // puede firmar checklists y crear stock requests
+  EMPLOYEE   // solo registra temperaturas y desperdicios
+}
+
+enum Shift {
+  MORNING   // apertura hasta mediodía
+  AFTERNOON // mediodía hasta cierre
+  CLOSING   // turno de cierre
+}
+
+enum ChecklistMoment {
+  OPENING  // antes de abrir
+  DURING   // durante operación
+  CLOSING  // al cerrar
+}
+
+enum StockRequestStatus {
+  DRAFT      // el supervisor lo está llenando
+  SUBMITTED  // enviado al warehouse
+  DISPATCHED // el warehouse lo despachó
+  CANCELLED
+}
+
+enum DiscardReason {
+  EXPIRED          // producto vencido
+  TEMP_VIOLATION   // estuvo fuera de rango de temperatura
+  OVERPRODUCTION   // se produjo más de lo que se vendió
+  DAMAGED          // daño físico
+  OTHER
+}
+
+// ─────────────────────────────────────────────
+// BUILDINGS
+// ─────────────────────────────────────────────
+
+model Building {
+  id        String  @id @default(uuid())
+  name      String  // ej: "Ice Cream Village", "Pizza Palace"
+  location  String  // descripción corta de ubicación en el parque
+  isActive  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // relaciones
+  users              User[]
+  foodTemperatures   FoodTemperature[]
+  freezerUnits       FreezerUnit[]
+  checklistSessions  ChecklistSession[]
+  stockRequests      StockRequest[]
+  wasteLogs          WasteLog[]
+  taskTemplates      TaskTemplate[]     // tareas específicas de este edificio
+
+  @@map("buildings")
+}
+
+// ─────────────────────────────────────────────
+// USERS
+// ─────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         UserRole @default(EMPLOYEE)
+  isActive     Boolean  @default(true)
+
+  // null = admin global sin edificio asignado
+  buildingId String?
+  building   Building? @relation(fields: [buildingId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // relaciones de actividad
+  foodTemperatures    FoodTemperature[]
+  freezerTemperatures FreezerTemperature[]
+  checklistSessions   ChecklistSession[]   @relation("SupervisorSessions")
+  checklistItems      ChecklistItem[]      @relation("CompletedItems")
+  stockRequests       StockRequest[]
+  wasteLogs           WasteLog[]
+
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────
+// TEMPERATURAS DE COMIDA
+// ─────────────────────────────────────────────
+
+model FoodTemperature {
+  id String @id @default(uuid())
+
+  buildingId  String
+  building    Building @relation(fields: [buildingId], references: [id])
+
+  recordedById String
+  recordedBy   User   @relation(fields: [recordedById], references: [id])
+
+  foodItem    String  // ej: "Hot Dogs", "Chicken Tenders"
+  temperatureC Float  // temperatura en Celsius
+
+  // rango seguro FDA: comida caliente >60°C, fría <4°C
+  minSafeTemp Float   @default(60.0) // para comidas calientes
+  maxSafeTemp Float   @default(4.0)  // para comidas frías
+  isInRange   Boolean               // calculado al guardar
+
+  shift    Shift
+  notes    String?
+
+  recordedAt DateTime @default(now())
+
+  @@index([buildingId, recordedAt])
+  @@index([isInRange])
+  @@map("food_temperatures")
+}
+
+// ─────────────────────────────────────────────
+// FREEZERS
+// ─────────────────────────────────────────────
+
+model FreezerUnit {
+  id          String  @id @default(uuid())
+  buildingId  String
+  building    Building @relation(fields: [buildingId], references: [id])
+
+  unitCode    String  // ej: "FRZ-01", "FRZ-02"
+  description String  // ej: "Freezer principal de helados"
+  minTempC    Float   @default(-18.0) // mínimo permitido
+  maxTempC    Float   @default(-15.0) // máximo permitido
+  isActive    Boolean @default(true)
+
+  createdAt DateTime @default(now())
+
+  temperatures FreezerTemperature[]
+
+  @@unique([buildingId, unitCode])
+  @@map("freezer_units")
+}
+
+model FreezerTemperature {
+  id String @id @default(uuid())
+
+  freezerUnitId String
+  freezerUnit   FreezerUnit @relation(fields: [freezerUnitId], references: [id])
+
+  recordedById String
+  recordedBy   User   @relation(fields: [recordedById], references: [id])
+
+  temperatureC Float
+  isInRange    Boolean
+  alertSent    Boolean @default(false) // si se envió email de alerta
+
+  recordedAt DateTime @default(now())
+
+  @@index([freezerUnitId, recordedAt])
+  @@index([isInRange, alertSent]) // para el job que envía alertas pendientes
+  @@map("freezer_temperatures")
+}
+
+// ─────────────────────────────────────────────
+// CHECKLIST
+// ─────────────────────────────────────────────
+
+// Plantillas de tareas (lo que el admin define)
+model TaskTemplate {
+  id       String          @id @default(uuid())
+  title    String          // ej: "Verificar temperatura del freezer principal"
+  moment   ChecklistMoment
+  sortOrder Int            @default(0)
+  isActive Boolean         @default(true)
+
+  // null = tarea global para todos los edificios
+  // con valor = tarea específica de ese edificio
+  buildingId String?
+  building   Building? @relation(fields: [buildingId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  checklistItems ChecklistItem[]
+
+  @@index([moment, isActive])
+  @@map("task_templates")
+}
+
+// Sesión diaria del checklist (una por momento por turno)
+model ChecklistSession {
+  id           String          @id @default(uuid())
+  buildingId   String
+  building     Building        @relation(fields: [buildingId], references: [id])
+  supervisorId String
+  supervisor   User            @relation("SupervisorSessions", fields: [supervisorId], references: [id])
+
+  sessionDate  DateTime        @db.Date
+  shift        Shift
+  moment       ChecklistMoment
+
+  // firma digital del supervisor
+  isSigned  Boolean   @default(false)
+  signedAt  DateTime?
+
+  createdAt DateTime @default(now())
+
+  items ChecklistItem[]
+
+  @@unique([buildingId, sessionDate, shift, moment]) // no duplicar sesiones
+  @@index([buildingId, sessionDate])
+  @@map("checklist_sessions")
+}
+
+// Cada tarea dentro de una sesión
+model ChecklistItem {
+  id        String @id @default(uuid())
+
+  sessionId  String
+  session    ChecklistSession @relation(fields: [sessionId], references: [id])
+
+  templateId String
+  template   TaskTemplate @relation(fields: [templateId], references: [id])
+
+  isCompleted  Boolean   @default(false)
+  observation  String?   // notas del empleado al completar
+  completedAt  DateTime?
+
+  completedById String?
+  completedBy   User?   @relation("CompletedItems", fields: [completedById], references: [id])
+
+  @@unique([sessionId, templateId]) // una tarea una vez por sesión
+  @@map("checklist_items")
+}
+
+// ─────────────────────────────────────────────
+// STOCK LIST
+// ─────────────────────────────────────────────
+
+model StockRequest {
+  id         String             @id @default(uuid())
+  buildingId String
+  building   Building           @relation(fields: [buildingId], references: [id])
+  createdById String
+  createdBy  User               @relation(fields: [createdById], references: [id])
+
+  requestDate DateTime          @db.Date
+  status      StockRequestStatus @default(DRAFT)
+  notes       String?
+
+  submittedAt  DateTime?
+  dispatchedAt DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  items StockRequestItem[]
+
+  @@index([buildingId, requestDate])
+  @@index([status])
+  @@map("stock_requests")
+}
+
+model StockRequestItem {
+  id        String @id @default(uuid())
+  requestId String
+  request   StockRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  productName String
+  unit        String  // ej: "kg", "unidades", "cajas"
+
+  quantityRequested  Float   // lo que pidió el supervisor
+  quantitySuggested  Float?  // lo que calculó el sistema (anti-desperdicio)
+  quantityDispatched Float?  // lo que realmente salió del warehouse
+
+  @@map("stock_request_items")
+}
+
+// ─────────────────────────────────────────────
+// DESPERDICIOS
+// ─────────────────────────────────────────────
+
+model WasteLog {
+  id String @id @default(uuid())
+
+  buildingId   String
+  building     Building @relation(fields: [buildingId], references: [id])
+  recordedById String
+  recordedBy   User     @relation(fields: [recordedById], references: [id])
+
+  productName       String
+  quantityKg        Float?  // peso en kg (opcional si se usa unidades)
+  quantityUnits     Int?    // cantidad en unidades (opcional)
+  estimatedCostUsd  Float?  // costo estimado del desperdicio
+
+  discardReason DiscardReason
+  shift         Shift
+  notes         String?
+
+  recordedAt DateTime @default(now())
+
+  @@index([buildingId, recordedAt])
+  @@index([productName, buildingId]) // para sugerencias de stock
+  @@map("waste_logs")
+}
